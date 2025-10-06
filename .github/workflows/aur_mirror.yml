@@ -3,7 +3,7 @@ name: AUR Mirror (Sharded PR)
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "23 3 * * *"
+    - cron: "23 3 * * *"   # daily @ 03:23 UTC
 
 permissions:
   contents: write
@@ -25,7 +25,7 @@ jobs:
       fail-fast: false
       max-parallel: 24
       matrix:
-        shard: [0,1,2,3,4,5,6,7,8,9,a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z,_, -]
+        shard: [0,1,2,3,4,5,6,7,8,9,a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z,"_","-"]
     steps:
       - name: Prepare sparse clone for this shard
         shell: bash
@@ -35,16 +35,15 @@ jobs:
           cd aur
           git remote add origin "${AUR_MIRROR}"
 
-          # Detect default branch ('main' vs 'master') from remote HEAD
-          DEFAULT_BRANCH="$(git ls-remote --symref origin HEAD | awk -F'/' '/^ref:/ {print $NF}')"
+          # Discover remote default branch robustly (main vs master)
+          git remote set-head origin -a
+          DEFAULT_BRANCH="$(git symbolic-ref --short refs/remotes/origin/HEAD | sed 's#^origin/##')"
           echo "Default branch: ${DEFAULT_BRANCH}"
 
-          # Partial clone: tree only, no blobs
+          # Partial clone: tree-only, no blobs; then sparse-checkout the prefix
           git fetch --depth=1 --filter=blob:none origin "${DEFAULT_BRANCH}"
-
-          # Non-cone sparse-checkout so we can use wildcard prefixes like a*/, 7*/, etc.
           git sparse-checkout init --no-cone
-          git sparse-checkout set "/${{ matrix.shard }}*/"
+          git sparse-checkout set "${{ matrix.shard }}*/"
           git checkout FETCH_HEAD
           cd ..
           tar -cf shard-${{ matrix.shard }}.tar aur
@@ -86,6 +85,7 @@ jobs:
             rsync -a _shard/aur/ aur/
             rm -rf _shard
           done
+          # Normalize perms for stable diffs
           find aur -type d -print0 | xargs -0 chmod 755
           find aur -type f -print0 | xargs -0 chmod 644
 
@@ -118,8 +118,8 @@ jobs:
 
             Source: ${{ env.AUR_MIRROR }}
             Notes:
-            - Uses partial clone + sparse-checkout (tree-only) per prefix.
-            - Detects remote default branch automatically.
+            - Partial clone + sparse-checkout (tree-only) per prefix.
+            - Remote default branch auto-detected.
           branch: "sync/aur-$(date -u +'%Y%m%d-%H%M')"
           labels: "aur, sync, automated"
           draft: true
