@@ -1,0 +1,127 @@
+name: AUR Mirror (Sharded PR)
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "23 3 * * *"   # daily @ 03:23 UTC
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  RSYNC_SRC: rsync://aur.archlinux.org/aur
+
+concurrency:
+  group: aurchy-sync
+  cancel-in-progress: false
+
+jobs:
+  shard:
+    name: Fetch shard (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 24     # adjust to taste
+      matrix:
+        shard: [
+          0,1,2,3,4,5,6,7,8,9,
+          a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z,
+          _,-   # catch edge names
+        ]
+    steps:
+      - name: Install rsync & prepare
+        run: |
+          sudo apt-get update && sudo apt-get install -y rsync tar
+          mkdir -p out/aur
+      - name: Rsync only top-level dirs starting with shard
+        shell: bash
+        run: |
+          # Pull only packages whose names begin with the shard prefix.
+          # AUR layout is flat: <pkgname>/PKGBUILD, so one-level include is enough.
+          rsync -av --delete \
+            --include='${{ matrix.shard }}*/' \
+            --exclude='*' \
+            "$RSYNC_SRC"/ out/aur/
+      - name: Pack shard
+        run: |
+          tar -C out -cf shard-${{ matrix.shard }}.tar aur
+      - name: Upload shard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: shard-${{ matrix.shard }}.tar
+          retention-days: 3
+
+  assemble:
+    name: Assemble & PR
+    needs: shard
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shards
+          merge-multiple: false
+
+      - name: Expand shards into aur/
+        shell: bash
+        run: |
+          rm -rf aur
+          mkdir -p aur
+          find shards -name 'shard-*.tar' -print0 | while IFS= read -r -d '' t; do
+            tar -xf "$t" -C .
+            # Each tar contains aur/<dirs>; merge into aur/
+            rsync -a aur/ .aur-merge/ 2>/dev/null || true
+            rm -rf aur
+            mv .aur-merge aur
+            rm -rf .aur-merge
+          done
+          # Ensure deterministic perms
+          find aur -type d -print0 | xargs -0 chmod 755
+          find aur -type f -print0 | xargs -0 chmod 644
+
+      - name: Git author
+        run: |
+          git config user.name  "aurchy-bot"
+          git config user.email "bot@omarchy.org"
+
+      - name: Commit if changed
+        id: commit
+        shell: bash
+        run: |
+          git add aur
+          if git diff --cached --quiet; then
+            echo "changed=0" >> $GITHUB_OUTPUT
+            echo "No changes."
+          else
+            echo "changed=1" >> $GITHUB_OUTPUT
+            SNAPSHOT_TS="$(date -u +'%Y-%m-%d %H:%M UTC')"
+            git commit -m "AUR mirror snapshot: ${SNAPSHOT_TS}"
+          fi
+
+      - name: Create/Update PR
+        if: steps.commit.outputs.changed == '1'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          title: "AUR mirror update ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+          body: |
+            Sharded AUR snapshot into `aur/`.
+            - Source: `rsync://aur.archlinux.org/aur`
+            - Runners: ${{ needs.shard.result }}
+            - Note: Each shard fetched prefix-matched package directories concurrently.
+          branch: "sync/aur-$(date -u +'%Y%m%d-%H%M')"
+          labels: "aur, sync, automated"
+          draft: true
+          signoff: true
+          add-paths: |
+            aur/**
+          token: ${{ secrets.GITHUB_TOKEN }}
