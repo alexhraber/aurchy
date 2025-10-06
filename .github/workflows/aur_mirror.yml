@@ -1,4 +1,4 @@
-name: AUR Mirror (Sharded PR)
+name: AUR Mirror (Sharded PR, brute retries)
 
 on:
   workflow_dispatch: {}
@@ -14,52 +14,64 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AUR_MIRROR: https://github.com/archlinux/aur.git
+  RSYNC_SRC: rsync://aur.archlinux.org/aur
 
 jobs:
   shard:
     name: Fetch shard (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 1080
     strategy:
       fail-fast: false
-      max-parallel: 24
+      max-parallel: 38
       matrix:
         shard: [0,1,2,3,4,5,6,7,8,9,a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z,"_","-"]
     steps:
-      - name: Prepare sparse clone for this shard
+      - name: Install rsync & prep
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rsync
+          mkdir -p out/aur
+
+      - name: Rsync shard with endless 60s retries
         shell: bash
         run: |
           set -euo pipefail
-          git init aur
-          cd aur
-          git remote add origin "${AUR_MIRROR}"
+          shard="${{ matrix.shard }}"
+          echo "Fetching shard prefix: '$shard*' from ${RSYNC_SRC}"
+          attempt=0
+          while true; do
+            attempt=$((attempt+1))
+            echo ":: Attempt $attempt — $(date -u)"
+            # -4 to prefer IPv4; include only this prefix; exclude everything else.
+            # We only need top-level entries like "<pkgname>/".
+            if rsync -4 -av --timeout=60 \
+                 --include="${shard}*/" \
+                 --exclude='*' \
+                 "${RSYNC_SRC}/" out/aur/; then
+              echo "Shard '${shard}' fetched successfully on attempt $attempt"
+              break
+            fi
+            echo "Shard '${shard}' failed (attempt $attempt). Sleeping 60s and retrying…"
+            sleep 60
+          done
 
-          # Discover remote default branch robustly (main vs master)
-          git remote set-head origin -a
-          DEFAULT_BRANCH="$(git symbolic-ref --short refs/remotes/origin/HEAD | sed 's#^origin/##')"
-          echo "Default branch: ${DEFAULT_BRANCH}"
-
-          # Partial clone: tree-only, no blobs; then sparse-checkout the prefix
-          git fetch --depth=1 --filter=blob:none origin "${DEFAULT_BRANCH}"
-          git sparse-checkout init --no-cone
-          git sparse-checkout set "${{ matrix.shard }}*/"
-          git checkout FETCH_HEAD
-          cd ..
-          tar -cf shard-${{ matrix.shard }}.tar aur
+      - name: Pack shard
+        run: |
+          tar -C out -cf shard-${{ matrix.shard }}.tar aur
 
       - name: Upload shard artifact
         uses: actions/upload-artifact@v4
         with:
           name: shard-${{ matrix.shard }}
           path: shard-${{ matrix.shard }}.tar
-          retention-days: 3
+          retention-days: 45
 
   assemble:
     name: Assemble & PR
     needs: shard
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 1080
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -116,10 +128,11 @@ jobs:
           body: |
             Sharded AUR snapshot into `aur/`.
 
-            Source: ${{ env.AUR_MIRROR }}
+            Source: ${{ env.RSYNC_SRC }}
             Notes:
-            - Partial clone + sparse-checkout (tree-only) per prefix.
-            - Remote default branch auto-detected.
+            - Direct rsync to aur.archlinux.org (Finland).
+            - Each shard retries every 60s until success (bounded by job timeout).
+            - IPv4 forced (-4) to dodge v6 routing quirks.
           branch: "sync/aur-$(date -u +'%Y%m%d-%H%M')"
           labels: "aur, sync, automated"
           draft: true
