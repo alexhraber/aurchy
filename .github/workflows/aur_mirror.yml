@@ -9,12 +9,13 @@ permissions:
   contents: write
   pull-requests: write
 
-env:
-  RSYNC_SRC: rsync://aur.archlinux.org/aur
-
 concurrency:
   group: aurchy-sync
   cancel-in-progress: false
+
+env:
+  # Use GitHub's fast mirror; avoids the Finland rsync SPOF.
+  AUR_MIRROR: https://github.com/archlinux/aur.git
 
 jobs:
   shard:
@@ -23,26 +24,27 @@ jobs:
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      max-parallel: 24     # adjust to taste
+      max-parallel: 2
       matrix:
         shard: [0,1,2,3,4,5,6,7,8,9,a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z,_, -]
     steps:
-      - name: Install rsync & prepare
-        run: |
-          sudo apt-get update && sudo apt-get install -y rsync tar
-          mkdir -p out/aur
-      - name: Rsync only top-level dirs starting with shard
+      - name: Prepare sparse clone for this shard
         shell: bash
         run: |
-          # Pull only packages whose names begin with the shard prefix.
-          # AUR layout is flat: <pkgname>/PKGBUILD, so one-level include is enough.
-          rsync -av --delete \
-            --include='${{ matrix.shard }}*/' \
-            --exclude='*' \
-            "$RSYNC_SRC"/ out/aur/
-      - name: Pack shard
-        run: |
-          tar -C out -cf shard-${{ matrix.shard }}.tar aur
+          set -euo pipefail
+          git init aur
+          cd aur
+          git remote add origin "${AUR_MIRROR}"
+          # Partial clone: tree only, no blobs
+          git fetch --depth=1 --filter=blob:none origin master
+          # Non-cone mode so we can use wildcard pathspecs like a*/
+          git sparse-checkout init --no-cone
+          # Each matrix.shard value is a single character except "_" and "-"
+          git sparse-checkout set "/${{ matrix.shard }}*/"
+          git checkout FETCH_HEAD
+          cd ..
+          tar -cf shard-${{ matrix.shard }}.tar aur
+
       - name: Upload shard artifact
         uses: actions/upload-artifact@v4
         with:
@@ -68,24 +70,24 @@ jobs:
           path: shards
           merge-multiple: false
 
-      - name: Expand shards into aur/
+      - name: Merge shards into aur/
         shell: bash
         run: |
+          set -euo pipefail
           rm -rf aur
           mkdir -p aur
+          # Merge each shard’s aur/ tree
           find shards -name 'shard-*.tar' -print0 | while IFS= read -r -d '' t; do
-            tar -xf "$t" -C .
-            # Each tar contains aur/<dirs>; merge into aur/
-            rsync -a aur/ .aur-merge/ 2>/dev/null || true
-            rm -rf aur
-            mv .aur-merge aur
-            rm -rf .aur-merge
+            rm -rf _shard && mkdir _shard
+            tar -xf "$t" -C _shard
+            rsync -a _shard/aur/ aur/
+            rm -rf _shard
           done
-          # Ensure deterministic perms
+          # Normalize perms for stable diffs
           find aur -type d -print0 | xargs -0 chmod 755
           find aur -type f -print0 | xargs -0 chmod 644
 
-      - name: Git author
+      - name: Configure git author
         run: |
           git config user.name  "aurchy-bot"
           git config user.email "bot@omarchy.org"
@@ -97,11 +99,11 @@ jobs:
           git add aur
           if git diff --cached --quiet; then
             echo "changed=0" >> $GITHUB_OUTPUT
-            echo "No changes."
+            echo "No changes detected."
           else
-            echo "changed=1" >> $GITHUB_OUTPUT
             SNAPSHOT_TS="$(date -u +'%Y-%m-%d %H:%M UTC')"
             git commit -m "AUR mirror snapshot: ${SNAPSHOT_TS}"
+            echo "changed=1" >> $GITHUB_OUTPUT
           fi
 
       - name: Create/Update PR
@@ -111,9 +113,12 @@ jobs:
           title: "AUR mirror update ($(date -u +'%Y-%m-%d %H:%M UTC'))"
           body: |
             Sharded AUR snapshot into `aur/`.
-            - Source: `rsync://aur.archlinux.org/aur`
-            - Runners: ${{ needs.shard.result }}
-            - Note: Each shard fetched prefix-matched package directories concurrently.
+
+            Source: `${{ env.AUR_MIRROR }}`
+            Runners: ${{ runner.os }} / matrix shards
+            Notes:
+            - Uses partial clone + sparse-checkout (tree-only) per prefix.
+            - Avoids aur.archlinux.org rsync completely.
           branch: "sync/aur-$(date -u +'%Y%m%d-%H%M')"
           labels: "aur, sync, automated"
           draft: true
