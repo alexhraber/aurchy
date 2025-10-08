@@ -104,7 +104,7 @@ jobs:
       - name: Configure git author
         run: |
           git config user.name  "aurchy-bot"
-          git config user.email "bot@omarchy.org"
+          git config user.email "bot@neuralnuance.com"
 
       - name: Commit if changed
         id: commit
